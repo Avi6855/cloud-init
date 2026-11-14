@@ -463,3 +463,85 @@ class TestNetworkManagerActivatorBringUp:
         should fail.
         """
         assert not NetworkManagerActivator.bring_up_interface("eth0")
+
+
+class TestNetplanDoesNotRequireSystemBus:
+    """GH-4044: `netplan apply` must not need the D-Bus system bus.
+
+    The network stage is ordered before sysinit.target on Ubuntu while
+    dbus.socket is ordered after it, so the bus does not exist yet. netplan
+    then cannot reach systemd-networkd, restarts it mid-startup and leaves the
+    configuration half applied, reporting the problem only on stderr.
+    """
+
+    @patch(
+        "cloudinit.net.activators.network_backend_running", return_value=False
+    )
+    @patch("cloudinit.net.activators.system_bus_available", return_value=False)
+    @patch("cloudinit.subp.subp", return_value=subp.SubpResult("", ""))
+    def test_generates_when_bus_missing_and_backend_not_started(
+        self, m_subp, _m_bus, _m_backend
+    ):
+        """The generated config is applied by the backend when it starts."""
+        assert NetplanActivator.bring_up_all_interfaces(None) is True
+        assert [c.args[0] for c in m_subp.call_args_list] == [
+            ["netplan", "generate"]
+        ]
+
+    @patch(
+        "cloudinit.net.activators.network_backend_running", return_value=False
+    )
+    @patch("cloudinit.net.activators.system_bus_available", return_value=False)
+    @patch("cloudinit.subp.subp", return_value=subp.SubpResult("", ""))
+    def test_never_runs_apply_without_the_bus(
+        self, m_subp, _m_bus, _m_backend
+    ):
+        """Every activation entrypoint avoids the racy apply."""
+        assert NetplanActivator.bring_up_interface("eth0") is True
+        assert NetplanActivator.bring_up_interfaces(["eth0"]) is True
+        assert NetplanActivator.bring_up_all_interfaces(None) is True
+        assert NetplanActivator.bring_down_interface("eth0") is True
+        assert ["netplan", "apply"] not in [
+            call.args[0] for call in m_subp.call_args_list
+        ]
+
+    @patch(
+        "cloudinit.net.activators.network_backend_running", return_value=True
+    )
+    @patch("cloudinit.net.activators.system_bus_available", return_value=False)
+    @patch("cloudinit.subp.subp", return_value=subp.SubpResult("", ""))
+    def test_backend_already_running_is_a_reported_failure(
+        self, m_subp, _m_bus, _m_backend
+    ):
+        """Nothing can apply the config, so don't claim success."""
+        assert NetplanActivator.bring_up_all_interfaces(None) is False
+        # Still generated, so the next networkd start picks it up.
+        assert [c.args[0] for c in m_subp.call_args_list] == [
+            ["netplan", "generate"]
+        ]
+
+    @patch("cloudinit.net.activators.system_bus_available", return_value=True)
+    @patch("cloudinit.subp.subp", return_value=subp.SubpResult("", ""))
+    def test_apply_is_used_when_the_bus_exists(self, m_subp, _m_bus):
+        """Normal boots keep the fast path."""
+        assert NetplanActivator.bring_up_all_interfaces(None) is True
+        assert [c.args[0] for c in m_subp.call_args_list] == [
+            ["netplan", "apply"]
+        ]
+
+    @patch("cloudinit.net.activators.system_bus_available", return_value=True)
+    @patch(
+        "cloudinit.subp.subp",
+        return_value=subp.SubpResult(
+            "", "Failed to connect system bus: No such file or directory"
+        ),
+    )
+    def test_missing_bus_error_is_not_silent_success(self, m_subp, _m_bus):
+        """The reported symptom must be visible to the caller."""
+        assert NetplanActivator.bring_up_all_interfaces(None) is False
+
+    @patch("cloudinit.net.activators.system_bus_available", return_value=True)
+    @patch("cloudinit.subp.subp", return_value=subp.SubpResult("", "harmless"))
+    def test_unrelated_stderr_is_still_success(self, m_subp, _m_bus):
+        """Unchanged behaviour for every other stderr message."""
+        assert NetplanActivator.bring_up_all_interfaces(None) is True

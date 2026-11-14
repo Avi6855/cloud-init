@@ -564,7 +564,13 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
                     "network interfaces"
                 )
                 return True
-            network_activator.bring_up_all_interfaces(network_state)
+            if not network_activator.bring_up_all_interfaces(network_state):
+                LOG.warning(
+                    "Failed to bring up all network interfaces with %s; "
+                    "network configuration may be incomplete",
+                    network_activator.__name__,
+                )
+                return True
         else:
             LOG.debug("Not bringing up newly configured network interfaces")
         return False

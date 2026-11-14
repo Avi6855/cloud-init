@@ -1,5 +1,6 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 import logging
+import os
 from abc import ABC, abstractmethod
 from functools import partial
 from typing import Callable, Dict, Iterable, List, Optional, Type
@@ -10,6 +11,32 @@ from cloudinit.net.netops.iproute2 import Iproute2
 from cloudinit.net.network_state import NetworkState
 
 LOG = logging.getLogger(__name__)
+
+# netplan apply reaches systemd-networkd through networkctl, and networkctl
+# needs the system bus. On Ubuntu this stage runs before sysinit.target while
+# dbus.socket runs after it, so early in boot the socket is often missing.
+SYSTEM_BUS_SOCKET = "/run/dbus/system_bus_socket"
+
+# What netplan prints when it cannot reach that socket. It still exits 0, after
+# restarting systemd-networkd, so the exit code alone does not show it.
+SYSTEM_BUS_UNAVAILABLE_ERR = "Failed to connect system bus"
+
+# Runtime state kept by the netplan backends. /run is a tmpfs, so these only
+# exist once the backend has started in this boot.
+NETWORKD_RUNTIME_DIR = "/run/systemd/netif"
+NETWORK_MANAGER_RUNTIME_DIR = "/run/NetworkManager"
+
+
+def system_bus_available() -> bool:
+    """Is the system bus socket there?"""
+    return os.path.exists(SYSTEM_BUS_SOCKET)
+
+
+def network_backend_running() -> bool:
+    """Has a netplan backend started in this boot?"""
+    return os.path.isdir(
+        os.path.join(NETWORKD_RUNTIME_DIR, "links")
+    ) or os.path.isdir(NETWORK_MANAGER_RUNTIME_DIR)
 
 
 class NoActivatorException(Exception):
@@ -213,6 +240,69 @@ class NetworkManagerActivator(NetworkActivator):
 
 class NetplanActivator(NetworkActivator):
     NETPLAN_CMD = ["netplan", "apply"]
+    NETPLAN_GENERATE_CMD = ["netplan", "generate"]
+
+    @staticmethod
+    def _apply() -> bool:
+        """Apply the netplan config, avoiding the system bus where we can.
+
+        netplan apply needs the bus to reach networkd. Early in boot it is
+        missing, so networkctl fails, netplan restarts networkd while it is
+        still coming up and the config ends up half applied. netplan only
+        writes a line to stderr, so cloud-init never noticed (GH-4044).
+
+        netplan generate needs no bus and writes what networkd reads at
+        startup. networkd starts after this stage, so when the bus is missing
+        and networkd is not up yet, generating is enough.
+        """
+        if not system_bus_available():
+            return NetplanActivator._generate_only()
+        return NetplanActivator._apply_with_bus()
+
+    @staticmethod
+    def _generate_only() -> bool:
+        """Write the config for networkd to pick up when it starts."""
+        if network_backend_running():
+            # The backends do not watch their config directories, so a file
+            # written now is only read the next time they start.
+            LOG.warning(
+                "Cannot apply the netplan configuration: the system bus is "
+                "not available and the network backend is already running. "
+                "The configuration will be applied the next time that "
+                "backend starts."
+            )
+            NetplanActivator._generate()
+            return False
+        LOG.info(
+            "System bus is not available yet; generating the netplan "
+            "configuration for systemd-networkd to apply at startup"
+        )
+        return NetplanActivator._generate()
+
+    @staticmethod
+    def _generate() -> bool:
+        return _alter_interface(
+            NetplanActivator.NETPLAN_GENERATE_CMD,
+            "all",
+            warn_on_stderr=False,
+        )
+
+    @staticmethod
+    def _apply_with_bus() -> bool:
+        """Run netplan apply; a bus error on stderr is a failure."""
+        try:
+            _out, err = subp.subp(NetplanActivator.NETPLAN_CMD)
+        except subp.ProcessExecutionError as e:
+            util.logexc(LOG, "Running interface command %s failed", e.cmd)
+            return False
+        if err:
+            if SYSTEM_BUS_UNAVAILABLE_ERR in err:
+                LOG.warning(
+                    "netplan apply could not reach the system bus: %s", err
+                )
+                return False
+            LOG.debug("Received stderr output: %s", err)
+        return True
 
     @staticmethod
     def available() -> bool:
@@ -229,9 +319,7 @@ class NetplanActivator(NetworkActivator):
             "Calling 'netplan apply' rather than "
             "altering individual interfaces"
         )
-        return _alter_interface(
-            NetplanActivator.NETPLAN_CMD, "all", warn_on_stderr=False
-        )
+        return NetplanActivator._apply()
 
     @staticmethod
     def bring_up_interfaces(device_names: Iterable[str]) -> bool:
@@ -243,9 +331,7 @@ class NetplanActivator(NetworkActivator):
             "Calling 'netplan apply' rather than "
             "altering individual interfaces"
         )
-        return _alter_interface(
-            NetplanActivator.NETPLAN_CMD, "all", warn_on_stderr=False
-        )
+        return NetplanActivator._apply()
 
     @staticmethod
     def bring_up_all_interfaces(network_state: NetworkState) -> bool:
@@ -253,9 +339,7 @@ class NetplanActivator(NetworkActivator):
 
         Return True is successful, otherwise return False
         """
-        return _alter_interface(
-            NetplanActivator.NETPLAN_CMD, "all", warn_on_stderr=False
-        )
+        return NetplanActivator._apply()
 
     @staticmethod
     def bring_down_interface(device_name: str) -> bool:
@@ -267,9 +351,7 @@ class NetplanActivator(NetworkActivator):
             "Calling 'netplan apply' rather than "
             "altering individual interfaces"
         )
-        return _alter_interface(
-            NetplanActivator.NETPLAN_CMD, "all", warn_on_stderr=False
-        )
+        return NetplanActivator._apply()
 
     @staticmethod
     def wait_for_network() -> None:

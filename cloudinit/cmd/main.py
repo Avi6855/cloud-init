@@ -572,7 +572,11 @@ def main_init(name, args):
                 LOG, "No instance datasource found! Likely bad things to come!"
             )
         if not args.force:
-            init.apply_network_config(bring_up=bring_up_interfaces)
+            if init.apply_network_config(bring_up=bring_up_interfaces):
+                LOG.warning(
+                    "Network configuration was not fully applied before "
+                    "exiting without a datasource"
+                )
             LOG.debug("[%s] Exiting without datasource", mode)
             if mode == sources.DSMODE_LOCAL:
                 return (None, [])
@@ -600,7 +604,11 @@ def main_init(name, args):
         # LP: #1746455.
         _maybe_set_hostname(init, stage="local", retry_stage="network")
 
-    init.apply_network_config(bring_up=bring_up_interfaces)
+    if init.apply_network_config(bring_up=bring_up_interfaces):
+        LOG.warning(
+            "Network configuration was not fully applied; later stages may "
+            "run without the expected network"
+        )
 
     if mode == sources.DSMODE_LOCAL:
         if features.MANUAL_NETWORK_WAIT:

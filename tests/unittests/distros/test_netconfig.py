@@ -644,6 +644,38 @@ class TestNetCfgDistroUbuntuNetplan:
             expected_cfgs=expected_cfgs,
         )
 
+    def test_apply_network_config_reports_activation_failure(
+        self, distro_netplan
+    ):
+        """GH-4044: a failed activation must not be reported as success.
+
+        apply_network_config() documents "True if any devices failed to come
+        up", but used to return False regardless of the activator result,
+        which is how the netplan bus failure stayed invisible.
+        """
+
+        class FailingActivator:
+            @staticmethod
+            def available():
+                return True
+
+            @staticmethod
+            def bring_up_all_interfaces(network_state):
+                return False
+
+        with mock.patch(
+            "cloudinit.net.netplan.available", return_value=True
+        ), mock.patch(
+            "cloudinit.net.netplan.get_devicelist",
+            return_value=self.DEV_LIST,
+        ), mock.patch(
+            "cloudinit.net.activators.select_activator",
+            return_value=FailingActivator,
+        ):
+            assert (
+                distro_netplan.apply_network_config(V1_NET_CFG, True) is True
+            )
+
     def test_apply_network_config_v1_ipv6_to_netplan_ub(
         self, distro_netplan, tmp_path
     ):
