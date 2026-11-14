@@ -5928,6 +5928,207 @@ class TestRenameInterfaces:
             ]
         )
 
+    @mock.patch("cloudinit.net.is_up", return_value=False)
+    @mock.patch("cloudinit.net.get_interface_mac")
+    @mock.patch("cloudinit.net.get_devicelist")
+    @mock.patch("cloudinit.subp.subp")
+    def test_rename_already_applied_by_udev(
+        self, mock_subp, m_devicelist, m_get_interface_mac, m_is_up
+    ):
+        """A rename udev already did is complete, not an error (GH-5075)."""
+        m_devicelist.return_value = ["interface0", "lo"]
+        m_get_interface_mac.return_value = "00:11:22:33:44:55"
+        renames = [("00:11:22:33:44:55", "interface0", None, None)]
+        current_info = {
+            "eth0": {
+                "downable": True,
+                "device_id": None,
+                "driver": None,
+                "mac": "00:11:22:33:44:55",
+                "name": "eth0",
+                "up": False,
+            },
+        }
+        net._rename_interfaces(renames, current_info=current_info)
+        # no rename is attempted for a device that already has the name;
+        # the link is still brought up.
+        assert mock_subp.call_args_list == [
+            mock.call(["ip", "link", "set", "dev", "interface0", "up"])
+        ]
+
+    @mock.patch("cloudinit.net.is_up", return_value=False)
+    @mock.patch("cloudinit.net.get_interface_mac")
+    @mock.patch("cloudinit.net.get_devicelist")
+    @mock.patch("cloudinit.subp.subp")
+    def test_rename_raced_after_planning_still_brings_link_up(
+        self, mock_subp, m_devicelist, m_get_interface_mac, m_is_up
+    ):
+        """udev can win after planning; down and rename fail, link comes up."""
+
+        def subp_side_effect(cmd, *args, **kwargs):
+            if cmd[-1] == "up":
+                return mock.Mock()
+            raise subp.ProcessExecutionError("RTNETLINK answers: File exists")
+
+        def devicelist_side_effect():
+            # Planning still sees the old name; by the time `ip` failed, udev
+            # has renamed the device.
+            if m_devicelist.call_count == 1:
+                return ["eth0", "lo"]
+            return ["interface0", "lo"]
+
+        mock_subp.side_effect = subp_side_effect
+        m_devicelist.side_effect = devicelist_side_effect
+        m_get_interface_mac.return_value = "00:11:22:33:44:55"
+        renames = [("00:11:22:33:44:55", "interface0", None, None)]
+        current_info = {
+            "eth0": {
+                "downable": True,
+                "device_id": None,
+                "driver": None,
+                "mac": "00:11:22:33:44:55",
+                "name": "eth0",
+                "up": True,
+            },
+        }
+        net._rename_interfaces(renames, current_info=current_info)
+        assert mock_subp.call_args_list[-1] == mock.call(
+            ["ip", "link", "set", "dev", "interface0", "up"]
+        )
+
+    @mock.patch("cloudinit.net.is_up", return_value=False)
+    @mock.patch("cloudinit.net.get_interface_mac")
+    @mock.patch("cloudinit.net.get_devicelist")
+    @mock.patch("cloudinit.subp.subp")
+    def test_rename_already_applied_busy_device(
+        self, mock_subp, m_devicelist, m_get_interface_mac, m_is_up
+    ):
+        """Stale 'up and not downable' state must not fail the rename."""
+        m_devicelist.return_value = ["interface0", "lo"]
+        m_get_interface_mac.return_value = "00:11:22:33:44:55"
+        renames = [("00:11:22:33:44:55", "interface0", None, None)]
+        current_info = {
+            "eth0": {
+                "downable": False,
+                "device_id": None,
+                "driver": None,
+                "mac": "00:11:22:33:44:55",
+                "name": "eth0",
+                "up": True,
+            },
+        }
+        net._rename_interfaces(renames, current_info=current_info)
+        assert mock_subp.call_args_list == [
+            mock.call(["ip", "link", "set", "dev", "interface0", "up"])
+        ]
+
+    @mock.patch("cloudinit.net.get_interface_mac")
+    @mock.patch("cloudinit.net.get_devicelist")
+    @mock.patch("cloudinit.subp.subp")
+    def test_rename_target_held_by_other_device_still_fails(
+        self, mock_subp, m_devicelist, m_get_interface_mac
+    ):
+        """A target name owned by a different mac must not be swallowed."""
+        mock_subp.side_effect = subp.ProcessExecutionError(
+            "RTNETLINK answers: File exists"
+        )
+        m_devicelist.return_value = ["interface0", "lo"]
+        m_get_interface_mac.return_value = "00:11:22:33:44:aa"
+        renames = [("00:11:22:33:44:55", "interface0", None, None)]
+        current_info = {
+            "eth0": {
+                "downable": True,
+                "device_id": None,
+                "driver": None,
+                "mac": "00:11:22:33:44:55",
+                "name": "eth0",
+                "up": False,
+            },
+        }
+        with pytest.raises(RuntimeError, match="File exists"):
+            net._rename_interfaces(renames, current_info=current_info)
+
+    @mock.patch("cloudinit.net.get_interface_mac")
+    @mock.patch("cloudinit.net.get_devicelist")
+    @mock.patch("cloudinit.subp.subp")
+    def test_rename_failure_with_old_name_present_still_fails(
+        self, mock_subp, m_devicelist, m_get_interface_mac
+    ):
+        """A plain rename failure is still an error."""
+        mock_subp.side_effect = subp.ProcessExecutionError(
+            "RTNETLINK answers: Operation not permitted"
+        )
+        m_devicelist.return_value = ["eth0", "lo"]
+        m_get_interface_mac.return_value = "00:11:22:33:44:55"
+        renames = [("00:11:22:33:44:55", "interface0", None, None)]
+        current_info = {
+            "eth0": {
+                "downable": True,
+                "device_id": None,
+                "driver": None,
+                "mac": "00:11:22:33:44:55",
+                "name": "eth0",
+                "up": False,
+            },
+        }
+        with pytest.raises(RuntimeError, match="Operation not permitted"):
+            net._rename_interfaces(renames, current_info=current_info)
+
+    @mock.patch("cloudinit.net.get_interface_mac")
+    @mock.patch("cloudinit.net.get_devicelist")
+    @mock.patch("cloudinit.subp.subp")
+    def test_rename_mixed_race_and_normal(
+        self, mock_subp, m_devicelist, m_get_interface_mac
+    ):
+        """One device lost the race, the other did not: both get renamed."""
+
+        def subp_side_effect(cmd, *args, **kwargs):
+            if "eth0" in cmd:
+                raise subp.ProcessExecutionError(
+                    "RTNETLINK answers: File exists"
+                )
+            return mock.Mock()
+
+        def devicelist_side_effect():
+            # Planning sees both old names; the retry check after eth0's
+            # EEXIST sees it renamed.
+            if m_devicelist.call_count <= 2:
+                return ["eth0", "eth1", "lo"]
+            return ["interface0", "eth1", "lo"]
+
+        mock_subp.side_effect = subp_side_effect
+        m_devicelist.side_effect = devicelist_side_effect
+        m_get_interface_mac.side_effect = lambda ifname: {
+            "interface0": "00:11:22:33:44:55",
+            "eth1": "00:11:22:33:44:aa",
+        }.get(ifname)
+        renames = [
+            ("00:11:22:33:44:55", "interface0", None, None),
+            ("00:11:22:33:44:aa", "interface1", None, None),
+        ]
+        current_info = {
+            "eth0": {
+                "downable": True,
+                "device_id": None,
+                "driver": None,
+                "mac": "00:11:22:33:44:55",
+                "name": "eth0",
+                "up": False,
+            },
+            "eth1": {
+                "downable": True,
+                "device_id": None,
+                "driver": None,
+                "mac": "00:11:22:33:44:aa",
+                "name": "eth1",
+                "up": False,
+            },
+        }
+        net._rename_interfaces(renames, current_info=current_info)
+        assert mock_subp.call_args_list[-1] == mock.call(
+            ["ip", "link", "set", "eth1", "name", "interface1"]
+        )
+
     @mock.patch("cloudinit.subp.subp")
     def test_rename_duplicate_macs(self, mock_subp):
         renames = [

@@ -757,6 +757,26 @@ def _get_current_rename_info(check_downable=True):
     return cur_info
 
 
+def _rename_already_applied(mac, old_name, new_name) -> bool:
+    """Return True when old_name is gone and new_name already has mac.
+
+    udev can apply the previous boot's persistent-net rule while we are
+    renaming, so the device may already sit under the name we want.  Accept
+    that only when the target is there, the old name is gone and the MAC
+    matches, otherwise a real conflict would go unnoticed.  (GH-5075)
+    """
+    if not mac or not old_name or old_name == new_name:
+        return False
+    try:
+        devs = get_devicelist()
+        if old_name in devs or new_name not in devs:
+            return False
+        return (get_interface_mac(new_name) or "").lower() == mac
+    except OSError:
+        # Never let the verification mask the real failure being handled.
+        return False
+
+
 def _rename_interfaces(
     renames, strict_present=True, strict_busy=True, current_info=None
 ):
@@ -839,6 +859,18 @@ def _rename_interfaces(
             # nothing to do
             continue
 
+        if _rename_already_applied(mac, cur_name, new_name):
+            # udev got there first: the device is already called new_name
+            # while our snapshot still says cur_name.  Leave the name alone,
+            # skip the stale up/downable bookkeeping, and just make sure the
+            # link is up.
+            LOG.debug(
+                "%s is already named %s, skipping rename", cur_name, new_name
+            )
+            if not is_up(new_name):
+                ups.append(("up", mac, new_name, (new_name,)))
+            continue
+
         if not cur_name:
             if strict_present:
                 errors.append(
@@ -906,6 +938,22 @@ def _rename_interfaces(
             try:
                 opmap[op](*params)
             except Exception as e:
+                # udev can still win after planning.  If the device is
+                # already under new_name with this mac, the failed down or
+                # rename is done, not broken.  The cirenameN swaps do not
+                # qualify: there the old name is new_name itself.
+                if op in ("down", "rename") and _rename_already_applied(
+                    mac, params[0], new_name
+                ):
+                    LOG.debug(
+                        "%s already renamed to %s by udev, ignoring %s "
+                        "failure: %s",
+                        params[0],
+                        new_name,
+                        op,
+                        e,
+                    )
+                    continue
                 errors.append(
                     "[unknown] Error performing %s%s for %s, %s: %s"
                     % (op, params, mac, new_name, e)
